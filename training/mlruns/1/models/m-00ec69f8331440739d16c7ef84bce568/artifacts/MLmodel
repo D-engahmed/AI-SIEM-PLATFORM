@@ -1,0 +1,22 @@
+artifact_path: /home/claude/repo/training/mlruns/1/models/m-00ec69f8331440739d16c7ef84bce568/artifacts
+flavors:
+  python_function:
+    data: model.ubj
+    env:
+      conda: conda.yaml
+      virtualenv: python_env.yaml
+    loader_module: mlflow.xgboost
+    python_version: 3.12.3
+  xgboost:
+    code: null
+    data: model.ubj
+    model_class: xgboost.core.Booster
+    model_format: ubj
+    xgb_version: 3.4.0
+mlflow_version: 3.15.1
+model_id: m-00ec69f8331440739d16c7ef84bce568
+model_size_bytes: 305574
+model_uuid: m-00ec69f8331440739d16c7ef84bce568
+prompts: null
+run_id: 59894054a21e4066a8a62190a1aa3269
+utc_time_created: '2026-08-18 09:40:56.492074'

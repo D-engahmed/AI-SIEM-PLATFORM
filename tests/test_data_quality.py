@@ -138,3 +138,61 @@ class TestScenarioShapesAreDistinguishable:
     def test_ti_confirmed_always_has_ti_matched_true(self, synthetic_df):
         ti_rows = synthetic_df[synthetic_df["scenario"] == "ti_confirmed"]
         assert (ti_rows["ti_matched"] == True).all()  # noqa: E712
+
+
+class TestDriftDetectionRealism:
+    """
+    Pins the corrected claim in generate_synthetic_data.py's module
+    docstring (2026-08-18): the injected drift is real (per the tests
+    above) but is NOT detectable by pooled whole-dataset PSI -- only by
+    PSI restricted to the two scenarios that actually shift. Runs
+    monitoring/generate_drift_report.py's actual code path (imported, not
+    reimplemented) so this stays true if that script ever changes.
+    """
+
+    def test_pooled_drift_report_does_not_alert(self, tmp_path):
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).parent.parent / "monitoring"))
+        sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+        from generate_drift_report import _load_features_split  # noqa: E402
+        from monitoring import compute_psi  # noqa: E402
+        from ml_scorer import FEATURE_NAMES  # noqa: E402
+
+        csv_path = Path(__file__).parent.parent / "training" / "synthetic_ml_scoring_tasks.csv"
+        X_ref, X_cur = _load_features_split(csv_path, "drifted_period")
+        psis = [compute_psi(X_ref[:, i], X_cur[:, i]) for i in range(len(FEATURE_NAMES))]
+        assert max(psis) < 0.1, (
+            "Pooled PSI now detects the drift -- either the data generator or the dilution "
+            "story in generate_synthetic_data.py's docstring is stale and needs updating, "
+            "not this test."
+        )
+
+    def test_scenario_restricted_drift_report_does_alert(self, tmp_path):
+        import csv
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).parent.parent / "monitoring"))
+        sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+        from generate_drift_report import _load_features_split  # noqa: E402
+        from monitoring import compute_psi  # noqa: E402
+        from ml_scorer import FEATURE_NAMES  # noqa: E402
+
+        full_path = Path(__file__).parent.parent / "training" / "synthetic_ml_scoring_tasks.csv"
+        rows = list(csv.DictReader(full_path.open()))
+        affected = [r for r in rows if r["scenario"] in ("loud_burst", "benign_shared_nat")]
+        restricted_path = tmp_path / "affected_only.csv"
+        with restricted_path.open("w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=rows[0].keys())
+            w.writeheader()
+            w.writerows(affected)
+
+        X_ref, X_cur = _load_features_split(restricted_path, "drifted_period")
+        psis = {name: compute_psi(X_ref[:, i], X_cur[:, i]) for i, name in enumerate(FEATURE_NAMES)}
+        assert psis["fan_in_count"] >= 0.25, (
+            f"Restricting to the two scenarios that actually shift no longer alerts "
+            f"(fan_in_count PSI={psis['fan_in_count']:.4f}) -- the drift-detection math itself "
+            f"may be broken now, unlike the pooled case above which is expected to stay quiet."
+        )

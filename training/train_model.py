@@ -40,6 +40,12 @@ from schemas import GraphFeatures, MLScoringTask, SignalContext  # noqa: E402
 DATA_PATH = Path(__file__).parent / "synthetic_ml_scoring_tasks.csv"
 ARTIFACT_DIR = Path(__file__).parent.parent / "artifacts"
 MODEL_VERSION = "gml-svc-0.1.0-synthetic"
+# Reference distribution for src/monitoring.py's PSI drift detection --
+# capped per-feature sample size, not the full training set. PSI's binning
+# is quantile-based, so beyond a few thousand samples more rows buy
+# smoother quantile estimates, not a meaningfully different reference --
+# not worth shipping a multi-MB artifact for.
+REFERENCE_SAMPLE_SIZE = 5000
 
 
 def load_rows() -> list[dict]:
@@ -124,6 +130,22 @@ def evaluate_low_and_slow_trap(booster: xgb.Booster) -> dict:
     return {"probabilities": probs, "passed": passed}
 
 
+def save_reference_distribution(X: np.ndarray, out_path: Path, seed: int = 13) -> None:
+    """
+    Saves a capped per-feature sample of the TRAINING feature matrix as the
+    baseline src/monitoring.py compares live traffic against. Sampling from
+    the full training set (not just X_train after the split, deliberately --
+    the reference should describe "what the model was built to expect",
+    which is the whole labeled dataset, not one split of it) keeps the
+    artifact small and the reference honest about the data's actual shape.
+    """
+    rng = np.random.RandomState(seed)
+    n = min(REFERENCE_SAMPLE_SIZE, len(X))
+    idx = rng.choice(len(X), size=n, replace=False)
+    sample = X[idx]
+    np.savez(out_path, **{name: sample[:, i] for i, name in enumerate(FEATURE_NAMES)})
+
+
 def main():
     rows = load_rows()
     X, y, scenarios = build_matrix(rows)
@@ -186,6 +208,7 @@ def main():
     joblib.dump(
         {
             "booster": booster,
+            "model_family": "xgboost",  # this script only ever trains xgboost -- see model_selection.ipynb for tuned cross-family comparison
             "model_version": MODEL_VERSION,
             "feature_names": FEATURE_NAMES,
         },
@@ -193,6 +216,9 @@ def main():
     )
     metrics_path = ARTIFACT_DIR / "model_latest.metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2))
+
+    reference_path = ARTIFACT_DIR / "feature_reference_distribution.npz"
+    save_reference_distribution(X, reference_path)
 
     print(json.dumps(metrics, indent=2))
     if not trap_result["passed"]:
@@ -206,6 +232,7 @@ def main():
 
     print(f"\nSaved model artifact -> {artifact_path}")
     print(f"Saved metrics         -> {metrics_path}")
+    print(f"Saved drift reference  -> {reference_path}")
 
 
 if __name__ == "__main__":

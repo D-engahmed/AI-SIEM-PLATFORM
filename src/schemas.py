@@ -1,27 +1,52 @@
 """
 Wire contracts for correlation-ml-service.
 
-ASSUMPTION FLAG (read this before trusting the input model):
+ASSUMPTION FLAG -- INBOUND SCHEMA (read before trusting this):
 --------------------------------------------------------------
-The task spec describes the `ml-scoring-tasks` payload only in prose
-(graph_features, signal_context, fan_in_count, epoch_age_seconds,
-ti_matched, target_kind). No real sample message was provided -- the
-uploaded `all_attack_incidents.json` is downstream *output* from other
-rule-based strategies (RiskBasedAlertingStrategy, BruteThenLoginPattern,
-etc.), not an ml-scoring-tasks input example, and it contains zero
-GraphPivotStrategy / GraphMLScoring records.
+The reviewer's first email (2026-08-17) claimed the ml-scoring-tasks
+payload has source_ip / signal_id / window_start / window_end at the
+ROOT level. That directly contradicts docs/ML_AI.md Section 2, which
+this service was originally built against, and describes a nested
+graph_features / signal_context shape instead. The reviewer's follow-up
+reply -- the one that answered every other open question in detail --
+never came back to this one. No real sample ml-scoring-tasks message has
+been provided either time.
 
-So the exact field names below (`triggering_source_ip`, the nesting of
-`graph_features` / `signal_context`, etc.) are a reasonable reconstruction
-from the prose spec, not a verified contract. Every upstream field name is
-declared in ONE place (this file) specifically so that when you show me a
-real sample message, fixing it is a one-file diff, not a rewrite.
+Given a confirmed written spec on one side and an unconfirmed, internally
+disputed claim on the other, the INBOUND shape below is UNCHANGED from
+the original spec-based reconstruction. Do not flatten this to root-level
+fields without an actual sample message to check it against -- every
+upstream field name is declared in ONE place (this file) specifically so
+that fix is a one-file diff when that sample shows up.
+
+OUTBOUND SCHEMA (2026-08-17 rewrite):
+--------------------------------------------------------------
+This DID change, on the strength of much stronger evidence: every one of
+the 65 "rich schema" records sampled from docs/all_attack_incidents.json
+nests strategy_name/linked_keys/degraded_mode/window_start/window_end
+inside `metadata`, and every one has metadata.raw_risk_score exactly
+10x its root-level risk_score. That's a live, consistent pattern, not
+just a claim in an email -- see IncidentEvent below.
+
+Two things this rewrite implements on a WEAKER footing, flagged so
+they're easy to find and revisit:
+  - risk_score is capped to a 0-100 int per the reviewer's explicit
+    instruction. There's a real open question (raised, not yet
+    answered) about whether correlation-ml-service should instead
+    publish on the SAME raw/uncapped scale other strategies apparently
+    use at the point they leave the strategy (RiskBasedAlertingStrategy
+    reaches 300 in the sampled data) and let whatever already does the
+    /10 conversion for everyone else do it here too. Implemented per
+    the explicit instruction; not independently confirmed.
+  - severity's LOW/MEDIUM/HIGH/CRITICAL score bands below are a
+    placeholder quartile split -- no real bands were ever given. Confirm
+    before shipping.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime
+from typing import Any, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -29,13 +54,34 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 MAX_LINKED_KEYS = 10
 MAX_KEY_LEN = 50
 MAX_VALUE_LEN = 255
+MAX_SIGNAL_IDS = 500
 
 STRATEGY_NAME = "GraphMLScoring"
 ESCALATED_STATUS = "ESCALATED_TO_INCIDENT"
 
+SEVERITY_VALUES = ("LOW", "MEDIUM", "HIGH", "CRITICAL")
+
+
+def severity_for_score(risk_score: int) -> str:
+    """
+    PLACEHOLDER -- no score->severity mapping was ever given (asked for,
+    not answered). This is a plain quartile split of the 0-100 range.
+    doc3 sec 3 says SOAR keys auto-containment off risk_score directly,
+    so severity may only be advisory downstream -- but confirm that
+    rather than assume it, since "advisory" and "unused" are very
+    different amounts of risk if this guess is wrong.
+    """
+    if risk_score >= 75:
+        return "CRITICAL"
+    if risk_score >= 50:
+        return "HIGH"
+    if risk_score >= 25:
+        return "MEDIUM"
+    return "LOW"
+
 
 # --------------------------------------------------------------------------
-# Inbound: ml-scoring-tasks
+# Inbound: ml-scoring-tasks (UNCHANGED -- see module docstring)
 # --------------------------------------------------------------------------
 
 class GraphFeatures(BaseModel):
@@ -113,75 +159,57 @@ class MLScoringTask(BaseModel):
 
 
 # --------------------------------------------------------------------------
-# Outbound: incidents
+# Outbound: incidents (AD-061 shape -- see module docstring)
 # --------------------------------------------------------------------------
 
 class IncidentEvent(BaseModel):
     """
-    Exact output contract for the `incidents` topic. Field order here
-    matches the spec's example so serialized output is easy to diff
-    against it by eye.
+    Root-field contract per AD-061: strategy-specific data lives in
+    `metadata`, not at the root. `status` and `incident_id` were both
+    observed at root in real sampled records; `incident_id` is not
+    generated here on the assumption it's assigned by whatever persists
+    this (unconfirmed -- flagged, not guessed at further).
     """
 
-    correlation_id: str
-    strategy_name: str = STRATEGY_NAME
-    linked_keys: dict[str, str]
-    signal_ids: list[str]
-    risk_score: float
+    title: str
+    source_ip: str
+    username: Optional[str] = Field(default=None, max_length=255)
+    protocol: Optional[str] = Field(default=None, max_length=20)
+    severity: str
+    risk_score: int
     status: str = ESCALATED_STATUS
-    degraded_mode: bool
-    window_start: datetime
-    window_end: datetime
+    correlation_id: Optional[UUID] = None
+    signal_ids: list[UUID] = Field(default_factory=list, max_length=MAX_SIGNAL_IDS)
+    tags: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     updated_at: Optional[datetime] = None
-    model_version: str = Field(exclude=True)  # internal audit field, NOT part of wire schema
 
     @field_validator("risk_score")
     @classmethod
-    def _score_range(cls, v: float) -> float:
-        if not (0.0 <= v <= 1000.0):
-            raise ValueError(f"risk_score {v} out of [0, 1000]")
+    def _score_range(cls, v: int) -> int:
+        if not (0 <= v <= 100):
+            raise ValueError(f"risk_score {v} out of [0, 100]")
         return v
 
-    @field_validator("linked_keys")
+    @field_validator("severity")
     @classmethod
-    def _linked_keys_bounds(cls, v: dict[str, str]) -> dict[str, str]:
-        if len(v) > MAX_LINKED_KEYS:
-            raise ValueError(f"linked_keys has {len(v)} entries, max {MAX_LINKED_KEYS}")
-        for k, val in v.items():
+    def _severity_enum(cls, v: str) -> str:
+        if v not in SEVERITY_VALUES:
+            raise ValueError(f"severity {v!r} not in {SEVERITY_VALUES}")
+        return v
+
+    @field_validator("metadata")
+    @classmethod
+    def _metadata_linked_keys_bounds(cls, v: dict[str, Any]) -> dict[str, Any]:
+        linked_keys = v.get("linked_keys")
+        if not isinstance(linked_keys, dict):
+            return v
+        if len(linked_keys) > MAX_LINKED_KEYS:
+            raise ValueError(f"linked_keys has {len(linked_keys)} entries, max {MAX_LINKED_KEYS}")
+        for k, val in linked_keys.items():
             if len(k) > MAX_KEY_LEN:
                 raise ValueError(f"linked_keys key '{k[:20]}...' exceeds {MAX_KEY_LEN} chars")
-            if len(val) > MAX_VALUE_LEN:
+            if len(str(val)) > MAX_VALUE_LEN:
                 raise ValueError(f"linked_keys value for '{k}' exceeds {MAX_VALUE_LEN} chars")
         return v
-
-    def to_wire_dict(self) -> dict:
-        """JSON-safe dict matching the exact published schema (Z-suffixed UTC ISO8601)."""
-        d = self.model_dump(mode="json", exclude={"model_version"})
-        for field in ("window_start", "window_end", "created_at", "updated_at"):
-            if d.get(field) is not None:
-                d[field] = _iso_z(getattr(self, field))
-        return d
-
-
-def _iso_z(dt: datetime) -> str:
-    """Match the observed wire format exactly: microseconds + literal 'Z' (not +00:00)."""
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
-
-
-class DLQEnvelope(BaseModel):
-    """Everything routed to dlq-correlation-ml gets wrapped like this."""
-
-    original_payload: dict
-    error_type: str
-    error_message: str
-    stage: str  # "deserialize" | "validate" | "inference" | "publish"
-    consumer_group: str
-    failed_at: datetime
-
-    def to_wire_dict(self) -> dict:
-        d = self.model_dump(mode="json")
-        d["failed_at"] = _iso_z(self.failed_at)
-        return d

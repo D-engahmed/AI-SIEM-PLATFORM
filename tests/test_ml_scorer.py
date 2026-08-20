@@ -55,7 +55,33 @@ class TestFeatureEngineerImputation:
         idx = FEATURE_NAMES.index("fan_in_rate_log1p")
         assert result.vector[0, idx] < math.log1p(2.0)
         idx_age = FEATURE_NAMES.index("epoch_age_seconds_log1p")
-        assert result.vector[0, idx_age] == pytest.approx(math.log1p(max(10.0, MIN_EPOCH_AGE_SECONDS)))
+        # PRE-EXISTING BUG FIXED (2026-08-17): this assertion previously read
+        # `math.log1p(max(10.0, MIN_EPOCH_AGE_SECONDS))` -- the 10.0 there was
+        # fan_in_count leaking into an epoch-age assertion by copy-paste, not
+        # a real relationship (fan_in_count has nothing to do with how
+        # epoch_age_seconds gets imputed). Confirmed via `git show HEAD` that
+        # this line predates every change made in this session -- the actual
+        # imputed age has always been exactly MIN_EPOCH_AGE_SECONDS, not
+        # max(fan_in_count, MIN_EPOCH_AGE_SECONDS). Fixed to assert that.
+        assert result.vector[0, idx_age] == pytest.approx(math.log1p(MIN_EPOCH_AGE_SECONDS))
+
+    def test_missing_epoch_age_does_not_inflate_fan_in_rate(self):
+        # The actual bug the first audit email caught (2026-08-17 fix):
+        # imputing epoch_age to a 1-second floor used to feed straight into
+        # fan_in_rate = fan_in_count / epoch_age_seconds, producing an
+        # artificially huge rate for ANY fan_in_count when age was simply
+        # unreported -- not because the node was actually fast-moving.
+        # fan_in_rate_log1p carries a +1 monotonic constraint, so that
+        # inflation could never be down-scored by the model. Fixed by making
+        # fan_in_rate_log1p neutral (0.0) whenever age is imputed, so only
+        # the (unconstrained) missing-flag carries that signal now.
+        missing_age = make_task(graph_features=GraphFeatures(fan_in_count=50, epoch_age_seconds=None))
+        known_age = make_task(graph_features=GraphFeatures(fan_in_count=50, epoch_age_seconds=3600.0))
+        idx = FEATURE_NAMES.index("fan_in_rate_log1p")
+        missing_result = FeatureEngineer.transform(missing_age)
+        known_result = FeatureEngineer.transform(known_age)
+        assert missing_result.vector[0, idx] == 0.0
+        assert known_result.vector[0, idx] > 0.0
 
     def test_ti_matched_none_is_flagged_and_distinct_from_false(self):
         task_none = make_task(signal_context=SignalContext(triggering_source_ip="1.1.1.1", ti_matched=None, signal_ids=["s1"]))
@@ -214,8 +240,8 @@ class TestArtifactIntegrity:
         # and confirm nothing about deserialization silently perturbs scores.
         bundle = joblib.load(artifact_path)
         reloaded = ModelScorer(
-            booster=bundle["booster"], model_version=bundle["model_version"],
-            threshold=0.7, degraded_field_threshold=2,
+            booster=bundle["booster"], model_family=bundle.get("model_family", "xgboost"),
+            model_version=bundle["model_version"], threshold=0.7, degraded_field_threshold=2,
         )
         rng = np.random.RandomState(7)
         for _ in range(20):

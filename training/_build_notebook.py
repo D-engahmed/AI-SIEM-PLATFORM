@@ -255,9 +255,9 @@ print(f"test set includes the injected drift period: {test_includes_drift}")
 
 # ----------------------------------------------------------------------
 md("""\
-## 5. Candidate models
+## 5. Candidate models — hyperparameter tuning, then cross-model comparison
 
-Three candidates, all on the spec's explicit allow-list (interpretable,
+Three model *families*, all on the spec's explicit allow-list (interpretable,
 no deep learning, no unsupervised anomaly detection as primary model):
 
 - **XGBoost** with monotonic constraints on `fan_in_count`, `fan_in_rate_log1p`,
@@ -268,8 +268,18 @@ no deep learning, no unsupervised anomaly detection as primary model):
   gets close to the tree models, that's a strong argument *for* shipping
   the simpler model instead
 
-Each run is logged to MLflow (local file store at `../mlruns`) as a
-nested run under one parent `model_selection` run.
+**Two-stage selection, not one:** for each family, several hyperparameter
+configs are tried (a small curated grid, not every config is worth trying
+on 56k rows of synthetic data). Every trial is scored on the **validation**
+split and logged as a nested MLflow run under a `<family>_tuning` parent.
+The best-by-validation-AP config per family is then re-evaluated exactly
+once on the **test** split — that final number is what section 6 onward
+compares across families.
+
+This two-stage split matters: picking hyperparameters AND reporting the
+winning number from the same split (test) is a well-known way to quietly
+overfit the split itself, not just the data. Val picks the config; test
+reports the number for that one already-fixed config, one time.
 """)
 
 code("""\
@@ -282,82 +292,200 @@ mlflow.set_experiment("correlation-ml-service")
 monotone_str = "(" + ",".join(str(MONOTONE_CONSTRAINTS[f]) for f in FEATURE_NAMES) + ")"
 monotone_list = [MONOTONE_CONSTRAINTS[f] for f in FEATURE_NAMES]
 
-results = {}
-models = {}
+results = {}       # final, test-set numbers for the WINNING config per family
+models = {}         # the fitted winning model per family
+tuning_results = {} # every trial's val metrics, per family -- for the plot in 5c
 """)
 
 code("""\
-# --- XGBoost ---
-with mlflow.start_run(run_name="xgboost_monotonic") as run:
-    dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=FEATURE_NAMES)
-    dval = xgb.DMatrix(X_val, label=y_val, feature_names=FEATURE_NAMES)
-    dtest = xgb.DMatrix(X_test, label=y_test, feature_names=FEATURE_NAMES)
+# --- XGBoost: hyperparameter sweep ---
+# Curated, not exhaustive -- these vary tree depth/learning-rate/subsampling,
+# the three knobs most likely to matter on a 9-feature, 56k-row problem.
+# monotone_constraints is NOT swept: it's a correctness requirement from the
+# spec, not a tunable hyperparameter -- every trial keeps it fixed.
+XGB_GRID = [
+    dict(max_depth=3, eta=0.05, subsample=0.8, colsample_bytree=0.8),
+    dict(max_depth=4, eta=0.10, subsample=0.8, colsample_bytree=0.8),
+    dict(max_depth=5, eta=0.10, subsample=0.7, colsample_bytree=0.7),
+    dict(max_depth=4, eta=0.20, subsample=0.9, colsample_bytree=0.9),
+]
 
-    params = dict(objective="binary:logistic", eval_metric="aucpr", max_depth=4, eta=0.1,
-                  subsample=0.8, colsample_bytree=0.8, monotone_constraints=monotone_str, seed=13)
-    mlflow.log_params(params)
+dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=FEATURE_NAMES)
+dval = xgb.DMatrix(X_val, label=y_val, feature_names=FEATURE_NAMES)
+dtest = xgb.DMatrix(X_test, label=y_test, feature_names=FEATURE_NAMES)
 
-    booster = xgb.train(params, dtrain, num_boost_round=300,
-                         evals=[(dtrain, "train"), (dval, "val")],
-                         early_stopping_rounds=20, verbose_eval=False)
+xgb_trials = []
+with mlflow.start_run(run_name="xgboost_tuning") as parent_run:
+    for i, grid_params in enumerate(XGB_GRID):
+        with mlflow.start_run(run_name=f"xgboost_trial_{i}", nested=True):
+            params = dict(objective="binary:logistic", eval_metric="aucpr",
+                          monotone_constraints=monotone_str, seed=13, **grid_params)
+            mlflow.log_params(params)
 
-    preds = booster.predict(dtest, iteration_range=(0, booster.best_iteration + 1))
-    auc = roc_auc_score(y_test, preds); ap = average_precision_score(y_test, preds)
-    brier = brier_score_loss(y_test, preds)
+            booster = xgb.train(params, dtrain, num_boost_round=300,
+                                 evals=[(dtrain, "train"), (dval, "val")],
+                                 early_stopping_rounds=20, verbose_eval=False)
+            val_preds = booster.predict(dval, iteration_range=(0, booster.best_iteration + 1))
+            val_ap = average_precision_score(y_val, val_preds)
+            mlflow.log_metrics({"val_avg_precision": val_ap, "best_iteration": booster.best_iteration})
+
+            xgb_trials.append(dict(params=grid_params, val_ap=val_ap,
+                                    best_iteration=booster.best_iteration, booster=booster))
+            print(f"  trial {i}: {grid_params} -> val_AP={val_ap:.4f} (best_iter={booster.best_iteration})")
+
+    best_xgb = max(xgb_trials, key=lambda t: t["val_ap"])
+    mlflow.log_metric("best_trial_val_ap", best_xgb["val_ap"])
+    mlflow.log_params({f"winner_{k}": v for k, v in best_xgb["params"].items()})
+
+tuning_results["xgboost"] = xgb_trials
+booster = best_xgb["booster"]
+preds = booster.predict(dtest, iteration_range=(0, booster.best_iteration + 1))
+auc = roc_auc_score(y_test, preds); ap = average_precision_score(y_test, preds)
+brier = brier_score_loss(y_test, preds)
+
+with mlflow.start_run(run_name="xgboost_monotonic_winner") as run:
+    mlflow.log_params(dict(objective="binary:logistic", monotone_constraints=monotone_str,
+                            seed=13, **best_xgb["params"]))
     mlflow.log_metrics({"test_roc_auc": auc, "test_avg_precision": ap, "test_brier": brier,
-                         "best_iteration": booster.best_iteration})
-
+                         "best_iteration": booster.best_iteration, "val_avg_precision": best_xgb["val_ap"]})
     results["xgboost"] = dict(preds=preds, auc=auc, ap=ap, brier=brier, run_id=run.info.run_id)
     models["xgboost"] = booster
-    print(f"xgboost   AUC={auc:.4f}  AP={ap:.4f}  Brier={brier:.4f}  best_iter={booster.best_iteration}")
+
+print(f"\\nBest XGBoost config: {best_xgb['params']} (val_AP={best_xgb['val_ap']:.4f})")
+print(f"xgboost   TEST AUC={auc:.4f}  AP={ap:.4f}  Brier={brier:.4f}  best_iter={booster.best_iteration}")
 """)
 
 code("""\
-# --- LightGBM ---
-with mlflow.start_run(run_name="lightgbm_monotonic") as run:
-    train_set = lgb.Dataset(X_train, label=y_train, feature_name=FEATURE_NAMES)
-    val_set = lgb.Dataset(X_val, label=y_val, feature_name=FEATURE_NAMES, reference=train_set)
+# --- LightGBM: hyperparameter sweep ---
+LGB_GRID = [
+    dict(max_depth=3, learning_rate=0.05, num_leaves=7,  feature_fraction=0.8, bagging_fraction=0.8),
+    dict(max_depth=4, learning_rate=0.10, num_leaves=15, feature_fraction=0.8, bagging_fraction=0.8),
+    dict(max_depth=5, learning_rate=0.10, num_leaves=31, feature_fraction=0.7, bagging_fraction=0.7),
+    dict(max_depth=4, learning_rate=0.20, num_leaves=15, feature_fraction=0.9, bagging_fraction=0.9),
+]
 
-    params = dict(objective="binary", metric="average_precision", max_depth=4, learning_rate=0.1,
-                  num_leaves=15, feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
-                  monotone_constraints=monotone_list, verbose=-1, seed=13)
-    mlflow.log_params(params)
+train_set = lgb.Dataset(X_train, label=y_train, feature_name=FEATURE_NAMES)
+val_set = lgb.Dataset(X_val, label=y_val, feature_name=FEATURE_NAMES, reference=train_set)
 
-    gbm = lgb.train(params, train_set, num_boost_round=300, valid_sets=[val_set],
-                     callbacks=[lgb.early_stopping(20, verbose=False)])
+lgb_trials = []
+with mlflow.start_run(run_name="lightgbm_tuning") as parent_run:
+    for i, grid_params in enumerate(LGB_GRID):
+        with mlflow.start_run(run_name=f"lightgbm_trial_{i}", nested=True):
+            params = dict(objective="binary", metric="average_precision",
+                          monotone_constraints=monotone_list, bagging_freq=1,
+                          verbose=-1, seed=13, **grid_params)
+            mlflow.log_params(params)
 
-    preds = gbm.predict(X_test, num_iteration=gbm.best_iteration)
-    auc = roc_auc_score(y_test, preds); ap = average_precision_score(y_test, preds)
-    brier = brier_score_loss(y_test, preds)
+            gbm = lgb.train(params, train_set, num_boost_round=300, valid_sets=[val_set],
+                             callbacks=[lgb.early_stopping(20, verbose=False)])
+            val_preds = gbm.predict(X_val, num_iteration=gbm.best_iteration)
+            val_ap = average_precision_score(y_val, val_preds)
+            mlflow.log_metrics({"val_avg_precision": val_ap, "best_iteration": gbm.best_iteration})
+
+            lgb_trials.append(dict(params=grid_params, val_ap=val_ap,
+                                    best_iteration=gbm.best_iteration, model=gbm))
+            print(f"  trial {i}: {grid_params} -> val_AP={val_ap:.4f} (best_iter={gbm.best_iteration})")
+
+    best_lgb = max(lgb_trials, key=lambda t: t["val_ap"])
+    mlflow.log_metric("best_trial_val_ap", best_lgb["val_ap"])
+    mlflow.log_params({f"winner_{k}": v for k, v in best_lgb["params"].items()})
+
+tuning_results["lightgbm"] = lgb_trials
+gbm = best_lgb["model"]
+preds = gbm.predict(X_test, num_iteration=gbm.best_iteration)
+auc = roc_auc_score(y_test, preds); ap = average_precision_score(y_test, preds)
+brier = brier_score_loss(y_test, preds)
+
+with mlflow.start_run(run_name="lightgbm_monotonic_winner") as run:
+    mlflow.log_params(dict(objective="binary", monotone_constraints=monotone_list,
+                            seed=13, **best_lgb["params"]))
     mlflow.log_metrics({"test_roc_auc": auc, "test_avg_precision": ap, "test_brier": brier,
-                         "best_iteration": gbm.best_iteration})
-
+                         "best_iteration": gbm.best_iteration, "val_avg_precision": best_lgb["val_ap"]})
     results["lightgbm"] = dict(preds=preds, auc=auc, ap=ap, brier=brier, run_id=run.info.run_id)
     models["lightgbm"] = gbm
-    print(f"lightgbm  AUC={auc:.4f}  AP={ap:.4f}  Brier={brier:.4f}  best_iter={gbm.best_iteration}")
+
+print(f"\\nBest LightGBM config: {best_lgb['params']} (val_AP={best_lgb['val_ap']:.4f})")
+print(f"lightgbm  TEST AUC={auc:.4f}  AP={ap:.4f}  Brier={brier:.4f}  best_iter={gbm.best_iteration}")
 """)
 
 code("""\
-# --- Logistic Regression (interpretable linear baseline) ---
-with mlflow.start_run(run_name="logistic_regression_baseline") as run:
-    scaler = StandardScaler().fit(X_train)
-    Xtr_s, Xte_s = scaler.transform(X_train), scaler.transform(X_test)
+# --- Logistic Regression: hyperparameter sweep (regularization strength) ---
+LR_GRID = [dict(C=0.01), dict(C=0.1), dict(C=1.0), dict(C=10.0)]
 
-    clf = LogisticRegression(max_iter=1000, C=1.0)
-    clf.fit(Xtr_s, y_train)
-    mlflow.log_params({"C": 1.0, "max_iter": 1000})
+scaler = StandardScaler().fit(X_train)
+Xtr_s, Xval_s, Xte_s = scaler.transform(X_train), scaler.transform(X_val), scaler.transform(X_test)
 
-    preds = clf.predict_proba(Xte_s)[:, 1]
-    auc = roc_auc_score(y_test, preds); ap = average_precision_score(y_test, preds)
-    brier = brier_score_loss(y_test, preds)
-    mlflow.log_metrics({"test_roc_auc": auc, "test_avg_precision": ap, "test_brier": brier})
+lr_trials = []
+with mlflow.start_run(run_name="logistic_regression_tuning") as parent_run:
+    for i, grid_params in enumerate(LR_GRID):
+        with mlflow.start_run(run_name=f"logreg_trial_{i}", nested=True):
+            params = dict(max_iter=1000, **grid_params)
+            mlflow.log_params(params)
 
+            clf = LogisticRegression(**params)
+            clf.fit(Xtr_s, y_train)
+            val_preds = clf.predict_proba(Xval_s)[:, 1]
+            val_ap = average_precision_score(y_val, val_preds)
+            mlflow.log_metric("val_avg_precision", val_ap)
+
+            lr_trials.append(dict(params=grid_params, val_ap=val_ap, clf=clf))
+            print(f"  trial {i}: {grid_params} -> val_AP={val_ap:.4f}")
+
+    best_lr = max(lr_trials, key=lambda t: t["val_ap"])
+    mlflow.log_metric("best_trial_val_ap", best_lr["val_ap"])
+    mlflow.log_params({f"winner_{k}": v for k, v in best_lr["params"].items()})
+
+tuning_results["logistic_regression"] = lr_trials
+clf = best_lr["clf"]
+preds = clf.predict_proba(Xte_s)[:, 1]
+auc = roc_auc_score(y_test, preds); ap = average_precision_score(y_test, preds)
+brier = brier_score_loss(y_test, preds)
+
+with mlflow.start_run(run_name="logistic_regression_winner") as run:
+    mlflow.log_params(dict(max_iter=1000, **best_lr["params"]))
+    mlflow.log_metrics({"test_roc_auc": auc, "test_avg_precision": ap, "test_brier": brier,
+                         "val_avg_precision": best_lr["val_ap"]})
     results["logistic_regression"] = dict(preds=preds, auc=auc, ap=ap, brier=brier, run_id=run.info.run_id)
     models["logistic_regression"] = (clf, scaler)
-    print(f"logreg    AUC={auc:.4f}  AP={ap:.4f}  Brier={brier:.4f}")
 
-    coef_df = pd.DataFrame({"feature": FEATURE_NAMES, "coefficient": clf.coef_[0]}).sort_values("coefficient")
-    print(coef_df.to_string(index=False))
+print(f"\\nBest LogReg config: {best_lr['params']} (val_AP={best_lr['val_ap']:.4f})")
+print(f"logreg    TEST AUC={auc:.4f}  AP={ap:.4f}  Brier={brier:.4f}")
+coef_df = pd.DataFrame({"feature": FEATURE_NAMES, "coefficient": clf.coef_[0]}).sort_values("coefficient")
+print(coef_df.to_string(index=False))
+""")
+
+md("""\
+### 5c. What the sweep actually bought us
+
+Each family's trials, by validation AP. If the bars within a family are
+all roughly the same height, that family's performance is *not*
+hyperparameter-sensitive on this data — worth knowing, since it means
+future retrains don't need to re-tune from scratch every time.
+""")
+
+code("""\
+fig, ax = plt.subplots(figsize=(10, 4))
+offset = 0
+xticks, xlabels = [], []
+colors = {"xgboost": "tab:blue", "lightgbm": "tab:green", "logistic_regression": "tab:orange"}
+for family, trials in tuning_results.items():
+    vals = [t["val_ap"] for t in trials]
+    xs = list(range(offset, offset + len(vals)))
+    bars = ax.bar(xs, vals, color=colors[family], label=family)
+    best_idx = int(np.argmax(vals))
+    bars[best_idx].set_edgecolor("black")
+    bars[best_idx].set_linewidth(2.5)
+    xticks.extend(xs)
+    xlabels.extend([f"trial {i}" for i in range(len(vals))])
+    offset += len(vals) + 1
+
+ax.set_xticks(xticks)
+ax.set_xticklabels(xlabels, rotation=45, ha="right", fontsize=8)
+ax.set_ylabel("validation avg. precision")
+ax.set_title("Hyperparameter sweep per model family (black outline = winner)")
+ax.legend()
+plt.tight_layout()
+plt.show()
 """)
 
 # ----------------------------------------------------------------------
@@ -509,6 +637,111 @@ else:
     print("logistic_regression's coefficients agree with all declared constraints.")
 """)
 
+md("""\
+### Permutation importance — a model-agnostic cross-check on gain importance
+
+Gain-based importance (used above) can overstate features that get split
+on a lot, even if those splits don't move predictions much. Permutation
+importance answers a more direct question: how much does shuffling ONE
+feature (breaking its relationship to the label, keeping everything else
+intact) hurt test-set AP? Computed by hand here rather than via
+`sklearn.inspection.permutation_importance`, since that helper expects a
+`.predict_proba(ndarray)`-shaped estimator and `xgb.Booster`/`lgb.Booster`
+don't expose that signature directly.
+""")
+
+code("""\
+def permutation_importance_manual(predict_fn, X, y, feature_names, n_repeats=5, seed=13):
+    rng = np.random.RandomState(seed)
+    baseline_ap = average_precision_score(y, predict_fn(X))
+    drops = {f: [] for f in feature_names}
+    for i, feat in enumerate(feature_names):
+        for _ in range(n_repeats):
+            X_shuffled = X.copy()
+            rng.shuffle(X_shuffled[:, i])  # in-place permute just this column
+            shuffled_ap = average_precision_score(y, predict_fn(X_shuffled))
+            drops[feat].append(baseline_ap - shuffled_ap)
+    return baseline_ap, {f: float(np.mean(v)) for f, v in drops.items()}
+
+
+def xgb_predict_fn(X):
+    return models["xgboost"].predict(
+        xgb.DMatrix(X, feature_names=FEATURE_NAMES),
+        iteration_range=(0, models["xgboost"].best_iteration + 1),
+    )
+
+baseline_ap, perm_importance = permutation_importance_manual(xgb_predict_fn, X_test, y_test, FEATURE_NAMES)
+
+perm_df = pd.Series(perm_importance).sort_values()
+fig, ax = plt.subplots(figsize=(8, 4))
+perm_df.plot.barh(ax=ax, color="slateblue")
+ax.set_title(f"XGBoost permutation importance (baseline test AP={baseline_ap:.4f})")
+ax.set_xlabel("mean AP drop when this feature is shuffled (higher = more important)")
+plt.tight_layout()
+plt.show()
+
+# Sanity cross-check, not just a nicer chart: gain importance and permutation
+# importance measuring genuinely different things is normal, but if they
+# picked completely DIFFERENT top features, that's worth a second look before
+# trusting either one.
+gain_top3 = set(pd.Series(models["xgboost"].get_score(importance_type="gain")).sort_values(ascending=False).head(3).index)
+perm_top3 = set(perm_df.sort_values(ascending=False).head(3).index)
+print(f"Gain top-3:        {gain_top3}")
+print(f"Permutation top-3: {perm_top3}")
+print(f"Overlap: {gain_top3 & perm_top3}")
+""")
+
+md("""\
+### Partial dependence — does monotonicity hold across the WHOLE range?
+
+Check A/B (section 7) probe two specific points. Partial dependence
+sweeps one feature across its full observed range (holding every other
+feature at its **median** test-set value) and plots the model's output —
+a direct visual check that "risk never decreases as this feature
+increases" actually holds everywhere, not just at the two points we
+happened to test.
+""")
+
+code("""\
+MONOTONE_FEATURES = [f for f, c in MONOTONE_CONSTRAINTS.items() if c != 0]
+
+fig, axes = plt.subplots(1, len(MONOTONE_FEATURES), figsize=(4.5 * len(MONOTONE_FEATURES), 4))
+if len(MONOTONE_FEATURES) == 1:
+    axes = [axes]
+
+median_row = np.median(X_test, axis=0)
+
+for ax, feat in zip(axes, MONOTONE_FEATURES):
+    idx = FEATURE_NAMES.index(feat)
+    lo, hi = np.percentile(X_test[:, idx], [1, 99])
+    sweep_vals = np.linspace(lo, hi, 50)
+
+    sweep_X = np.tile(median_row, (50, 1))
+    sweep_X[:, idx] = sweep_vals
+
+    xgb_pdp = models["xgboost"].predict(
+        xgb.DMatrix(sweep_X, feature_names=FEATURE_NAMES),
+        iteration_range=(0, models["xgboost"].best_iteration + 1),
+    )
+    lgb_pdp = models["lightgbm"].predict(sweep_X, num_iteration=models["lightgbm"].best_iteration)
+
+    ax.plot(sweep_vals, xgb_pdp, label="xgboost", color="tab:blue")
+    ax.plot(sweep_vals, lgb_pdp, label="lightgbm", color="tab:green")
+    ax.set_title(feat)
+    ax.set_xlabel(feat)
+    ax.set_ylabel("predicted probability")
+    ax.legend(fontsize=8)
+
+    constraint = MONOTONE_CONSTRAINTS[feat]
+    diffs = np.diff(xgb_pdp) * constraint
+    if np.any(diffs < -1e-9):
+        ax.set_facecolor("#fff0f0")
+        print(f"*** {feat}: xgboost PDP is NOT monotonic across the full range (constraint={constraint}) ***")
+
+plt.tight_layout()
+plt.show()
+""")
+
 # ----------------------------------------------------------------------
 md("""\
 ## 9. Model selection
@@ -600,7 +833,11 @@ ARTIFACT_DIR.mkdir(exist_ok=True)
 chosen_booster = models[winner]
 
 artifact_path = ARTIFACT_DIR / "model_latest.joblib"
-joblib.dump({"booster": chosen_booster, "model_version": MODEL_VERSION, "feature_names": FEATURE_NAMES}, artifact_path)
+joblib.dump(
+    {"booster": chosen_booster, "model_family": winner,
+     "model_version": MODEL_VERSION, "feature_names": FEATURE_NAMES},
+    artifact_path,
+)
 print("Saved:", artifact_path)
 
 log_fn = mlflow.xgboost.log_model if winner == "xgboost" else mlflow.lightgbm.log_model
@@ -615,10 +852,46 @@ with mlflow.start_run(run_name="register_winner") as run:
 client = mlflow.MlflowClient()
 versions = client.search_model_versions("name='correlation-ml-service-risk-model'")
 latest = max(versions, key=lambda v: int(v.version))
+# model_family/model_version tags are how ModelScorer.load_from_mlflow (the
+# CML_MODEL_SOURCE=mlflow path in src/ml_scorer.py) knows which flavor-
+# specific loader to use and what version string to log -- mlflow.pyfunc's
+# generic load path would hide the xgboost-vs-lightgbm distinction entirely.
+client.set_model_version_tag(
+    name="correlation-ml-service-risk-model", version=latest.version,
+    key="model_family", value=winner,
+)
+client.set_model_version_tag(
+    name="correlation-ml-service-risk-model", version=latest.version,
+    key="model_version", value=MODEL_VERSION,
+)
 client.transition_model_version_stage(
     name="correlation-ml-service-risk-model", version=latest.version, stage="Staging",
 )
-print(f"Model version {latest.version} ({winner}) moved to Staging.")
+print(f"Model version {latest.version} ({winner}) tagged and moved to Staging.")
+""")
+
+md("""\
+## 11. Feature reference distribution (for src/monitoring.py's drift detection)
+
+Saves a capped 5,000-row-per-feature sample of the full labeled dataset
+(train+val+test combined -- the reference should describe what the model
+was built to expect overall, not just its training split) as the fixed
+baseline `FeatureDriftMonitor` compares live traffic against via PSI. Same
+artifact `training/train_model.py` produces on every retrain; saved here
+too so a notebook-selected model has a matching reference from the start.
+""")
+
+code("""\
+REFERENCE_SAMPLE_SIZE = 5000
+X_all = feat_df_sorted[FEATURE_NAMES].to_numpy()
+
+rng = np.random.RandomState(13)
+idx = rng.choice(len(X_all), size=min(REFERENCE_SAMPLE_SIZE, len(X_all)), replace=False)
+sample = X_all[idx]
+
+reference_path = ARTIFACT_DIR / "feature_reference_distribution.npz"
+np.savez(reference_path, **{name: sample[:, i] for i, name in enumerate(FEATURE_NAMES)})
+print(f"Saved feature reference distribution -> {reference_path} ({len(sample)} samples/feature)")
 """)
 
 md("""\

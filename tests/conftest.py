@@ -33,14 +33,14 @@ def artifact_path() -> Path:
 def scorer(artifact_path):
     from ml_scorer import ModelScorer
 
-    return ModelScorer.load(str(artifact_path), threshold=0.7, degraded_field_threshold=2)
+    return ModelScorer.load(str(artifact_path), threshold=0.5, degraded_field_threshold=2)
 
 
 @pytest.fixture(scope="session")
 def handler(scorer):
     from ml_consumer import MLScoringHandler
 
-    return MLScoringHandler(scorer=scorer, consumer_group="correlation-ml-service")
+    return MLScoringHandler(scorer=scorer)
 
 
 @pytest.fixture(scope="session")

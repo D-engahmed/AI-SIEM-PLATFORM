@@ -1,106 +1,103 @@
 """
 Kafka wiring for correlation-ml-service.
 
-HONEST GAP (do not skip this comment): the spec says ml_consumer.py
-"inherits from shared.kafka", but no interface for that base class (method
-names, callback shape, sync vs async, commit semantics) was provided or
-discoverable in this conversation. Guessing a subclass signature for a
-library I've never seen would produce code that *looks* wired up but
-silently doesn't match the real base class -- worse than not writing it,
-because it hides the gap instead of surfacing it.
+2026-08-17: rewritten against shared/kafka/ (our local stand-in -- see
+that package's docstring for why it's local and not the real platform
+package). Kept the original two-layer split on purpose:
 
-So this file is split in two, deliberately:
+  1. MLScoringHandler -- pure business logic (validate, score, decide
+     incident-vs-dlq-vs-drop). No Kafka objects touch this class. Takes
+     an already-deserialized dict now instead of raw bytes, since
+     BaseConsumer owns orjson deserialization.
 
-  1. MLScoringHandler -- the actual business logic (parse, validate,
-     score, decide incidents-vs-dlq-vs-drop). Pure, synchronous,
-     dependency-injected, fully unit tested. This is correct regardless
-     of what shared.kafka turns out to look like, and should NOT need to
-     change when you wire in the real base class.
-
-  2. StandaloneRunner -- a working confluent_kafka-based outer loop, used
-     when shared.kafka isn't importable (e.g. running this repo
-     standalone, or in tests/CI). This is the part that's a guess. When
-     you have the real shared.kafka.BaseConsumer, replace StandaloneRunner
-     with a subclass of it that calls MLScoringHandler.handle_raw() from
-     whatever its message callback is named -- that should be close to a
-     ~20 line adapter, not a rewrite.
+  2. CorrelationMLConsumer(BaseConsumer) -- the thin adapter the original
+     module docstring predicted would exist once a real base class showed
+     up ("that should be close to a ~20 line adapter, not a rewrite").
+     It's wired to our local stand-in instead of the real package, but
+     the shape is exactly what was described.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import signal
-import sys
-import time
 from dataclasses import dataclass
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any, Optional
+from uuid import UUID
 
 from pydantic import ValidationError
 
 from config import Settings
+from metrics import DEGRADED_MESSAGES_TOTAL
 from ml_scorer import ModelScorer
+from monitoring import FeatureDriftMonitor
 from schemas import (
     ESCALATED_STATUS,
-    DLQEnvelope,
+    STRATEGY_NAME,
     IncidentEvent,
     MLScoringTask,
-    _iso_z,
+    severity_for_score,
 )
-from datetime import datetime, timezone
+from shared.kafka.base_consumer import BaseConsumer
 
 logger = logging.getLogger("correlation_ml.consumer")
 
 SUPPORTED_TARGET_KINDS = {"user"}  # spec: device tracking disabled upstream, don't build for it
+MAX_SIGNAL_IDS = 500
+
+
+@dataclass
+class DlqInfo:
+    payload: dict[str, Any]
+    error: Exception
+    stage: str
 
 
 @dataclass
 class HandleResult:
-    incident: Optional[dict] = None
-    dlq: Optional[dict] = None
+    incident: Optional[dict[str, Any]] = None
+    dlq: Optional[DlqInfo] = None
     # neither set => silently dropped (valid message, model said don't escalate)
+    # Set whenever scoring actually ran (i.e. not on a validate/inference DLQ),
+    # regardless of escalation outcome. Kept on HandleResult rather than
+    # incremented inside handle_payload() itself (2026-08-18 fix) -- see
+    # CorrelationMLConsumer.process_message() for why.
+    degraded_mode: bool = False
+    # Same reasoning as degraded_mode: the drift monitor's ring buffer must
+    # only see REAL topic traffic, not ad-hoc POST /score test calls, so
+    # recording it is CorrelationMLConsumer's job, not handle_payload()'s.
+    feature_vector: Optional[dict[str, float]] = None
 
 
 class MLScoringHandler:
     """
-    Pure per-message logic. No Kafka objects touch this class -- it takes
-    raw bytes in and returns a decision. That's what makes it swap-proof
-    against whatever shared.kafka's real API looks like, and what makes
-    it trivial to unit test (see tests/test_ml_consumer.py).
+    Pure per-message logic. No Kafka objects touch this class -- that's
+    what makes it swap-proof against whatever the real shared.kafka turns
+    out to look like, and what makes it trivial to unit test (see
+    tests/test_ml_consumer.py).
     """
 
-    def __init__(self, scorer: ModelScorer, consumer_group: str):
+    def __init__(self, scorer: ModelScorer):
         self._scorer = scorer
-        self._consumer_group = consumer_group
 
-    def handle_raw(self, raw_bytes: bytes) -> HandleResult:
-        # --- stage: deserialize ---
-        try:
-            raw_text = raw_bytes.decode("utf-8")
-            payload_dict = json.loads(raw_text)
-        except (UnicodeDecodeError, json.JSONDecodeError) as e:
-            return HandleResult(dlq=self._dlq(
-                original_payload={"_raw_undecodable": True, "byte_len": len(raw_bytes)},
-                error=e, stage="deserialize",
-            ))
-
+    def handle_payload(self, payload: dict[str, Any]) -> HandleResult:
         # --- stage: validate ---
         try:
-            task = MLScoringTask.model_validate(payload_dict)
+            task = MLScoringTask.model_validate(payload)
         except ValidationError as e:
-            return HandleResult(dlq=self._dlq(original_payload=payload_dict, error=e, stage="validate"))
+            return HandleResult(dlq=DlqInfo(payload=payload, error=e, stage="validate"))
 
         if task.target_kind not in SUPPORTED_TARGET_KINDS:
             # Fail closed rather than silently mis-scoring a target type we
             # were told never to build logic for.
             err = ValueError(f"unsupported target_kind={task.target_kind!r}")
-            return HandleResult(dlq=self._dlq(original_payload=payload_dict, error=err, stage="validate"))
+            return HandleResult(dlq=DlqInfo(payload=payload, error=err, stage="validate"))
 
         # --- stage: inference ---
         try:
             result = self._scorer.score(task)
         except Exception as e:  # noqa: BLE001 - model/feature-pipeline errors are genuinely unpredictable
-            return HandleResult(dlq=self._dlq(original_payload=payload_dict, error=e, stage="inference"))
+            return HandleResult(dlq=DlqInfo(payload=payload, error=e, stage="inference"))
 
         if result.status != ESCALATED_STATUS:
             # Spec: "Drop the message silently otherwise." This is a normal
@@ -109,179 +106,117 @@ class MLScoringHandler:
                 "correlation_id=%s below threshold prob=%.4f model_version=%s",
                 task.correlation_id, result.probability, result.model_version,
             )
-            return HandleResult()
+            return HandleResult(degraded_mode=result.degraded_mode, feature_vector=result.feature_vector)
 
         # --- stage: publish (build + validate outbound contract) ---
         source_ip = task.signal_context.triggering_source_ip or "unknown"
-        linked_keys = {"ip": source_ip, "user": task.target_value}
         now = datetime.now(timezone.utc)
         window_start = task.signal_context.window_start or now
         window_end = task.signal_context.window_end or now
 
+        signal_ids_raw = task.signal_context.signal_ids or []
+        truncated = len(signal_ids_raw) > MAX_SIGNAL_IDS
+        signal_ids_kept = signal_ids_raw[:MAX_SIGNAL_IDS]
+
+        try:
+            correlation_uuid = UUID(task.correlation_id)
+            signal_uuids = [UUID(s) for s in signal_ids_kept]
+        except ValueError as e:
+            return HandleResult(dlq=DlqInfo(payload=payload, error=e, stage="publish"))
+
+        metadata: dict[str, Any] = {
+            "strategy_name": STRATEGY_NAME,
+            "linked_keys": {"ip": source_ip, "user": task.target_value},
+            "degraded_mode": result.degraded_mode,
+            "window_start": window_start,
+            "window_end": window_end,
+            "model_version": result.model_version,
+        }
+        if truncated:
+            metadata["signal_ids_truncated"] = True
+            metadata["signal_count"] = len(signal_ids_raw)
+
         try:
             incident = IncidentEvent(
-                correlation_id=task.correlation_id,
-                linked_keys=linked_keys,
-                signal_ids=task.signal_context.signal_ids or [],
+                title=f"Graph ML Anomaly for user: {task.target_value}",
+                source_ip=source_ip,
+                username=task.target_value,
+                protocol=None,
+                severity=severity_for_score(result.risk_score),
                 risk_score=result.risk_score,
-                degraded_mode=result.degraded_mode,
-                window_start=window_start,
-                window_end=window_end,
+                correlation_id=correlation_uuid,
+                signal_ids=signal_uuids,
+                tags=[],
+                metadata=metadata,
                 created_at=now,
                 updated_at=None,
-                model_version=result.model_version,
             )
         except ValidationError as e:
             # e.g. a linked_keys value blew past the 255-char contract limit.
             # This is a real failure, not a silent drop -- we scored it as an
             # incident but can't legally publish it as one.
-            return HandleResult(dlq=self._dlq(original_payload=payload_dict, error=e, stage="publish"))
+            return HandleResult(dlq=DlqInfo(payload=payload, error=e, stage="publish"))
 
         logger.info(
-            "ESCALATED correlation_id=%s risk_score=%.1f degraded_mode=%s model_version=%s imputed=%s",
-            task.correlation_id, result.risk_score, result.degraded_mode,
+            "ESCALATED correlation_id=%s risk_score=%d severity=%s degraded_mode=%s "
+            "model_version=%s imputed=%s",
+            task.correlation_id, result.risk_score, incident.severity, result.degraded_mode,
             result.model_version, result.imputed_fields,
         )
-        return HandleResult(incident=incident.to_wire_dict())
-
-    def _dlq(self, *, original_payload: dict, error: Exception, stage: str) -> dict:
-        logger.warning("DLQ stage=%s error=%s: %s", stage, type(error).__name__, error)
-        env = DLQEnvelope(
-            original_payload=original_payload,
-            error_type=type(error).__name__,
-            error_message=str(error)[:2000],  # bound it -- error string is partly attacker-influenced
-            stage=stage,
-            consumer_group=self._consumer_group,
-            failed_at=datetime.now(timezone.utc),
+        # mode="python" (not "json") on purpose -- keeps datetime/UUID as
+        # native objects so the producer's orjson serializer (OPT_UTC_Z)
+        # controls the final wire format, matching the observed "...Z"
+        # timestamp suffix. See shared/kafka/base_producer.py.
+        return HandleResult(
+            incident=incident.model_dump(mode="python"),
+            degraded_mode=result.degraded_mode,
+            feature_vector=result.feature_vector,
         )
-        return env.to_wire_dict()
 
 
-# --------------------------------------------------------------------------
-# Outer loop -- GUESSED framework glue, see module docstring.
-# --------------------------------------------------------------------------
-
-try:
-    from shared.kafka import BaseKafkaConsumer  # type: ignore  # real thing, if it exists in this repo
-    _HAVE_SHARED_KAFKA = True
-except ImportError:
-    _HAVE_SHARED_KAFKA = False
-
-
-class StandaloneRunner:
+class CorrelationMLConsumer(BaseConsumer):
     """
-    Working confluent_kafka outer loop, used only when shared.kafka isn't
-    available. Fail-closed error handling, non-blocking produce, offsets
-    committed only after both produces (incident-or-dlq) are confirmed
-    delivered -- so a crash mid-produce causes a redelivery (at-least-once,
-    possible duplicate incident) rather than a silent drop.
+    Thin adapter between our local shared.kafka stand-in and the pure
+    MLScoringHandler -- the ~20-line layer the original module docstring
+    predicted.
     """
 
-    def __init__(self, settings: Settings, handler: MLScoringHandler):
-        try:
-            from confluent_kafka import Consumer, Producer
-        except ImportError as e:
-            raise RuntimeError(
-                "confluent-kafka is not installed and shared.kafka was not importable. "
-                "Install confluent-kafka for standalone use, or provide shared.kafka."
-            ) from e
-
-        self._settings = settings
+    def __init__(self, settings: Settings, handler: MLScoringHandler, monitor: Optional[FeatureDriftMonitor] = None):
+        super().__init__(
+            bootstrap_servers=settings.kafka_bootstrap_servers,
+            topic=settings.consume_topic,
+            group_id=settings.consumer_group_id,
+            dlq_topic=settings.produce_topic_dlq,
+            max_consecutive_errors=settings.max_consecutive_errors,
+        )
         self._handler = handler
-        self._consumer = Consumer({
-            "bootstrap.servers": settings.kafka_bootstrap_servers,
-            "group.id": settings.consumer_group_id,
-            "enable.auto.commit": False,  # we commit explicitly after successful produce
-            "auto.offset.reset": "earliest",
-        })
-        self._producer = Producer({"bootstrap.servers": settings.kafka_bootstrap_servers})
-        self._running = False
-        self._consecutive_errors = 0
+        self._incidents_topic = settings.produce_topic_incidents
+        # Optional: None when training/train_model.py hasn't been run yet
+        # to produce a reference distribution -- see FeatureDriftMonitor.load().
+        self._monitor = monitor
 
-    def _produce_sync(self, topic: str, key: str, value: dict, timeout: float = 10.0) -> bool:
-        """Produce one message and block only until delivery is confirmed or times out."""
-        delivered = {"ok": False, "err": None}
+    async def process_message(self, payload: dict[str, Any]) -> None:
+        result = self._handler.handle_payload(payload)
 
-        def _cb(err, _msg):
-            delivered["ok"] = err is None
-            delivered["err"] = err
+        if self._monitor is not None and result.feature_vector is not None:
+            self._monitor.record(result.feature_vector)
 
-        try:
-            self._producer.produce(
-                topic, key=key.encode("utf-8"), value=json.dumps(value).encode("utf-8"), callback=_cb,
+        # 2026-08-18: moved here from MLScoringHandler.handle_payload() --
+        # this counter is upstream-data-quality visibility for REAL topic
+        # traffic (doc3 point 3), regardless of escalation outcome. It
+        # belongs on the Kafka-specific adapter, not the pure business
+        # logic, precisely because api.py's POST /score also calls
+        # handle_payload() for ad-hoc test/integration requests that must
+        # NOT be counted as production data-quality signal.
+        if result.degraded_mode:
+            DEGRADED_MESSAGES_TOTAL.inc()
+
+        if result.incident is not None:
+            await self._producer.produce(
+                self._incidents_topic,
+                key=str(result.incident["correlation_id"]),
+                value=result.incident,
             )
-        except BufferError as e:
-            logger.error("producer queue full, backing off: %s", e)
-            return False
-
-        remaining = timeout
-        step = 0.05
-        while remaining > 0 and delivered["err"] is None and not delivered["ok"]:
-            self._producer.poll(step)
-            remaining -= step
-        return delivered["ok"]
-
-    def _handle_signal(self, signum, _frame):
-        logger.info("received signal %s, shutting down after current message", signum)
-        self._running = False
-
-    def run(self):
-        signal.signal(signal.SIGTERM, self._handle_signal)
-        signal.signal(signal.SIGINT, self._handle_signal)
-
-        self._consumer.subscribe([self._settings.consume_topic])
-        self._running = True
-        logger.info(
-            "consumer started topic=%s group=%s", self._settings.consume_topic, self._settings.consumer_group_id,
-        )
-
-        try:
-            while self._running:
-                msg = self._consumer.poll(self._settings.consumer_poll_timeout_seconds)
-                if msg is None:
-                    continue
-                if msg.error():
-                    self._consecutive_errors += 1
-                    logger.error("kafka poll error: %s", msg.error())
-                    if self._consecutive_errors >= self._settings.max_consecutive_errors:
-                        raise RuntimeError("too many consecutive Kafka errors, failing closed")
-                    continue
-
-                result = self._handler.handle_raw(msg.value())
-
-                ok = True
-                if result.incident is not None:
-                    ok = self._produce_sync(
-                        self._settings.produce_topic_incidents,
-                        key=result.incident["correlation_id"],
-                        value=result.incident,
-                    )
-                elif result.dlq is not None:
-                    ok = self._produce_sync(
-                        self._settings.produce_topic_dlq,
-                        key=result.dlq.get("original_payload", {}).get("correlation_id", "unknown"),
-                        value=result.dlq,
-                    )
-                # else: silent drop, nothing to produce, offset still advances
-
-                if ok:
-                    self._consumer.commit(msg, asynchronous=False)
-                    self._consecutive_errors = 0
-                else:
-                    self._consecutive_errors += 1
-                    logger.error("produce failed, NOT committing offset, will redeliver")
-                    if self._consecutive_errors >= self._settings.max_consecutive_errors:
-                        raise RuntimeError("too many consecutive produce failures, failing closed")
-        finally:
-            self._producer.flush(10.0)
-            self._consumer.close()
-            logger.info("consumer stopped cleanly")
-
-
-def build_runner(settings: Settings, handler: MLScoringHandler):
-    if _HAVE_SHARED_KAFKA:
-        raise NotImplementedError(
-            "shared.kafka was importable but this repo doesn't know its interface yet. "
-            "Wire MLScoringHandler.handle_raw() into your BaseKafkaConsumer subclass here."
-        )
-    return StandaloneRunner(settings, handler)
+        elif result.dlq is not None:
+            await self.route_to_dlq(result.dlq.payload, result.dlq.error, stage=result.dlq.stage)
+        # else: silent drop -- valid message, model said don't escalate

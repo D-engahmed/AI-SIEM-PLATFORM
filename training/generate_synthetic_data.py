@@ -49,8 +49,21 @@ Time axis + injected drift:
   increases (simulating a growing office). This isn't meant to be a
   realistic drift *cause* -- it exists so docs/06-monitoring.md and
   monitoring/generate_drift_report.py have a KNOWN, verifiable shift to
-  detect. If the drift report doesn't flag DRIFT_WINDOW_FRACTION, that's
-  a real bug in the monitoring code, not noise.
+  detect.
+
+  CORRECTED CLAIM (2026-08-18, found by actually running the check this
+  comment used to describe): the drift is only detectable pooled across
+  ALL 7 scenarios if you restrict the comparison to the two affected
+  scenarios first. Comparing drifted_period=True vs False across the FULL
+  dataset does NOT clear the alert threshold (tested: PSI stays under 0.05
+  for every feature) -- the shift, real and by-construction, gets diluted
+  into invisibility by the 5 scenarios that don't move. That's not a bug
+  in compute_psi (unit-tested separately against synthetic shifts of known
+  size) or a monitoring-code defect -- it's a genuine, well-known PSI
+  limitation: aggregate population-level drift detection can miss a real
+  shift that's concentrated in a minority subpopulation. See
+  docs/06-monitoring.md for the worked example and what it implies for
+  how this metric should actually be read in production.
 """
 
 from __future__ import annotations
@@ -65,7 +78,13 @@ random.seed(13)
 
 OUT_PATH = Path(__file__).parent / "synthetic_ml_scoring_tasks.csv"
 
-N_PER_SCENARIO = 2500
+# 2026-08-18: raised from 2500 -> 8000 (17.5k -> 56k total rows) on request
+# for "more data". Deliberately NOT done by adding new scenarios or widening
+# the existing ranges -- every one of the 7 scenario functions below is
+# unchanged; this only samples each one more times. More rows from the same
+# documented-and-signed-off-on generative process is a reasonable ask; rows
+# from an 8th invented scenario nobody has reviewed would not be.
+N_PER_SCENARIO = 8000
 MISSING_FIELD_RATE = 0.12  # fraction of rows with a null'd out field, per the spec's "don't assume fully populated"
 
 WINDOW_DAYS = 45
